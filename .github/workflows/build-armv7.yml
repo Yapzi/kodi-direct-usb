@@ -1,5 +1,5 @@
 
-name: Maven 20.5 Direct USB ARMv7
+name: Maven 20.5 Direct USB ARMv7 M2
 
 on:
   workflow_dispatch:
@@ -53,8 +53,6 @@ jobs:
           sed -i 's/>@APP_NAME@</>Kodi Direct USB</g' \
             tools/android/packaging/xbmc/strings.xml.in
 
-          cat version.txt
-
       - name: Generate debug signing key
         run: |
           mkdir -p "$HOME/.android"
@@ -74,9 +72,6 @@ jobs:
       - name: Configure ARMv7
         working-directory: kodi/tools/depends
         run: |
-          echo "SDK: $ANDROID_HOME"
-          echo "SDK Manager: $(command -v sdkmanager)"
-
           test -f "$ANDROID_HOME/platforms/android-33/android.jar"
           test -f "$ANDROID_HOME/ndk/21.4.7075529/source.properties"
 
@@ -85,15 +80,10 @@ jobs:
 
           p = Path("configure.ac")
           s = p.read_text()
-
           old = 'if [ ! test -f $use_sdk_path/tools/bin/sdkmanager ]; then'
           new = 'if ! command -v sdkmanager >/dev/null 2>&1; then'
-
-          assert old in s, "SDK path check not found"
-
+          assert old in s
           p.write_text(s.replace(old, new, 1))
-
-          print("Modern Android SDK compatibility patch applied")
           PY
 
           ./bootstrap
@@ -128,377 +118,1380 @@ jobs:
           path: ~/kodi-depends
           key: maven205-e00e52ee-armv7-ndk21e-ubuntu2204-v1
 
-      - name: Add M1 Direct USB probe
+      - name: Build libusb ARMv7
         working-directory: kodi
         run: |
+          ROOT="$PWD"
+          DEST="$ROOT/directusb"
+          mkdir -p "$DEST"
+
+          TOOLCHAIN="$ANDROID_HOME/ndk/21.4.7075529/toolchains/llvm/prebuilt/linux-x86_64"
+
+          curl -fL --retry 3 \
+            https://github.com/libusb/libusb/releases/download/v1.0.27/libusb-1.0.27.tar.bz2 \
+            -o /tmp/libusb-1.0.27.tar.bz2
+
+          tar -xjf /tmp/libusb-1.0.27.tar.bz2 -C /tmp
+
+          cd /tmp/libusb-1.0.27
+
+          export CC="$TOOLCHAIN/bin/armv7a-linux-androideabi21-clang"
+          export AR="$TOOLCHAIN/bin/llvm-ar"
+          export RANLIB="$TOOLCHAIN/bin/llvm-ranlib"
+          export STRIP="$TOOLCHAIN/bin/llvm-strip"
+          export CFLAGS="-O2 -fPIC"
+
+          ./configure \
+            --host=arm-linux-androideabi \
+            --disable-udev \
+            --disable-shared \
+            --enable-static
+
+          make -j2
+
+          cp libusb/.libs/libusb-1.0.a "$DEST/"
+          cp libusb/libusb.h "$DEST/"
+          cp COPYING "$DEST/libusb-COPYING"
+
+          ls -lh "$DEST"
+
+      - name: Add USB permission and JNI bridge
+        working-directory: kodi
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("tools/android/packaging/xbmc/src/Main.java.in")
+          s = p.read_text()
+
+          marker = "public static Main MainActivity = null;"
+
+          addition = r'''
+
+            public static android.hardware.usb.UsbDevice
+            directUsbFind(android.content.Context context)
+            {
+              android.hardware.usb.UsbManager manager =
+                  (android.hardware.usb.UsbManager)
+                  context.getSystemService(Context.USB_SERVICE);
+
+              if (manager == null)
+                return null;
+
+              for (android.hardware.usb.UsbDevice d :
+                   manager.getDeviceList().values())
+              {
+                if (d.getVendorId() == 0x152a &&
+                    d.getProductId() == 0x8750)
+                  return d;
+              }
+              return null;
+            }
+
+            public int directUsbPresent()
+            {
+              return directUsbFind(this) != null ? 1 : 0;
+            }
+
+            public int directUsbOpen()
+            {
+              android.hardware.usb.UsbDeviceConnection connection = null;
+
+              try
+              {
+                android.hardware.usb.UsbManager manager =
+                    (android.hardware.usb.UsbManager)
+                    getSystemService(USB_SERVICE);
+
+                android.hardware.usb.UsbDevice device =
+                    directUsbFind(this);
+
+                if (manager == null || device == null)
+                  return -1;
+
+                if (!manager.hasPermission(device))
+                {
+                  Log.e("KodiDirectUSB",
+                        "M2_FAIL: USB permission required");
+                  return -1;
+                }
+
+                connection = manager.openDevice(device);
+
+                if (connection == null)
+                  return -1;
+
+                android.os.ParcelFileDescriptor duplicate =
+                    android.os.ParcelFileDescriptor.fromFd(
+                        connection.getFileDescriptor());
+
+                int fd = duplicate.detachFd();
+
+                Log.i("KodiDirectUSB",
+                      "M2_JNI_OPEN: fd=" + fd);
+
+                return fd;
+              }
+              catch (Exception e)
+              {
+                Log.e("KodiDirectUSB", "USB open failed", e);
+                return -1;
+              }
+              finally
+              {
+                if (connection != null)
+                  connection.close();
+              }
+            }
+
+          '''
+
+          addition = addition.replace(
+              "Context.USB_SERVICE",
+              "android.content.Context.USB_SERVICE"
+          )
+
+          assert s.count(marker) == 1
+          p.write_text(s.replace(marker, marker + addition, 1))
+
+          manifest = Path(
+              "tools/android/packaging/xbmc/AndroidManifest.xml.in"
+          )
+
+          s = manifest.read_text()
+
+          activity = '''
+              <activity
+                  android:name=".UsbDirectProbe"
+                  android:label="Direct USB Authorization"
+                  android:screenOrientation="landscape"
+                  android:permission="android.permission.DUMP"
+                  android:exported="true" />
+          '''
+
+          assert s.count("</application>") == 1
+
+          manifest.write_text(
+              s.replace("</application>",
+                        activity + "</application>", 1)
+          )
+
+          cmake = Path("cmake/scripts/android/Install.cmake")
+          s = cmake.read_text()
+          assert s.count("src/Main.java") == 1
+
+          cmake.write_text(
+              s.replace("src/Main.java",
+                        "src/Main.java\n"
+                        "                  src/UsbDirectProbe.java",
+                        1)
+          )
+          PY
+
           cat > tools/android/packaging/xbmc/src/UsbDirectProbe.java.in <<'JAVA'
           package @APP_PACKAGE@;
 
           import android.app.Activity;
           import android.app.PendingIntent;
-          import android.content.BroadcastReceiver;
-          import android.content.Context;
-          import android.content.Intent;
-          import android.content.IntentFilter;
+          import android.content.*;
           import android.hardware.usb.*;
           import android.os.Build;
           import android.os.Bundle;
           import android.util.Log;
-          import android.widget.Button;
-          import android.widget.LinearLayout;
-          import android.widget.TextView;
+          import android.widget.*;
           import java.util.UUID;
 
-          public class UsbDirectProbe extends Activity {
-
-              private static final String TAG = "KodiDirectUSB";
-
-              private UsbManager manager;
+          public class UsbDirectProbe extends Activity
+          {
               private TextView status;
-              private String permissionAction;
-              private boolean registered = false;
+              private String action;
+              private boolean registered;
 
               private final BroadcastReceiver receiver =
-                  new BroadcastReceiver() {
+                  new BroadcastReceiver()
+                  {
                       @Override
-                      public void onReceive(
-                          Context context,
-                          Intent intent
-                      ) {
-                          if (permissionAction.equals(intent.getAction())) {
-                              probe(false);
-                          }
+                      public void onReceive(Context c, Intent i)
+                      {
+                          if (action.equals(i.getAction()))
+                              check(false);
                       }
                   };
 
               @Override
-              protected void onCreate(Bundle state) {
-
+              public void onCreate(Bundle state)
+              {
                   super.onCreate(state);
 
-                  manager = (UsbManager)
-                      getSystemService(USB_SERVICE);
-
-                  permissionAction = getPackageName() +
+                  action = getPackageName() +
                       ".USB_PERMISSION." +
                       UUID.randomUUID().toString();
 
                   LinearLayout layout = new LinearLayout(this);
-
                   layout.setOrientation(LinearLayout.VERTICAL);
                   layout.setPadding(40, 40, 40, 40);
-                  layout.setBackgroundColor(0xff101820);
 
                   status = new TextView(this);
-                  status.setTextColor(0xffffffff);
-                  status.setTextSize(22);
-
+                  status.setTextSize(24);
                   layout.addView(status);
 
                   Button retry = new Button(this);
-                  retry.setText("Retry USB detection");
-                  retry.setOnClickListener(v -> probe(true));
-
+                  retry.setText("Authorize USB DAC");
+                  retry.setOnClickListener(v -> check(true));
                   layout.addView(retry);
 
                   Button close = new Button(this);
-                  close.setText("Close diagnostic");
+                  close.setText("Close");
                   close.setOnClickListener(v -> finish());
-
                   layout.addView(close);
 
                   setContentView(layout);
-
                   retry.requestFocus();
 
-                  IntentFilter filter =
-                      new IntentFilter(permissionAction);
+                  IntentFilter filter = new IntentFilter(action);
 
-                  if (Build.VERSION.SDK_INT >= 33) {
-
+                  if (Build.VERSION.SDK_INT >= 33)
                       registerReceiver(
-                          receiver,
-                          filter,
-                          Context.RECEIVER_NOT_EXPORTED
-                      );
-
-                  } else {
-
+                          receiver, filter,
+                          Context.RECEIVER_NOT_EXPORTED);
+                  else
                       registerReceiver(receiver, filter);
 
-                  }
-
                   registered = true;
-
-                  probe(true);
+                  check(true);
               }
 
-              private void report(String text) {
+              private void check(boolean request)
+              {
+                  UsbManager manager =
+                      (UsbManager)getSystemService(USB_SERVICE);
 
-                  Log.i(TAG, text);
-                  status.setText(text);
+                  UsbDevice device = Main.directUsbFind(this);
 
-              }
-
-              private UsbDevice findDac() {
-
-                  for (UsbDevice d :
-                       manager.getDeviceList().values()) {
-
-                      Log.i(
-                          TAG,
-                          String.format(
-                              "USB device %04x:%04x %s",
-                              d.getVendorId(),
-                              d.getProductId(),
-                              d.getProductName()
-                          )
-                      );
-
-                      if (
-                          d.getVendorId() == 0x152a &&
-                          d.getProductId() == 0x8750
-                      ) {
-                          return d;
-                      }
+                  if (manager == null || device == null)
+                  {
+                      status.setText("DX3 Pro+ not found");
+                      return;
                   }
 
-                  return null;
-              }
+                  if (manager.hasPermission(device))
+                  {
+                      status.setText(
+                          "DX3 Pro+\nUSB permission granted\n" +
+                          "Close this screen and launch Kodi.");
 
-              private void probe(boolean requestPermission) {
+                      Log.i("KodiDirectUSB",
+                            "M2_PERMISSION_GRANTED");
+                      return;
+                  }
 
-                  try {
+                  status.setText("USB permission required");
 
-                      if (manager == null) {
+                  if (request)
+                  {
+                      PendingIntent pi =
+                          PendingIntent.getBroadcast(
+                              this, 0,
+                              new Intent(action)
+                                  .setPackage(getPackageName()),
+                              PendingIntent.FLAG_IMMUTABLE |
+                              PendingIntent.FLAG_ONE_SHOT);
 
-                          report("M1_FAIL: UsbManager unavailable");
-                          return;
-
-                      }
-
-                      UsbDevice dac = findDac();
-
-                      if (dac == null) {
-
-                          report("M1_FAIL: DX3 Pro+ not found");
-                          return;
-
-                      }
-
-                      boolean audioControl = false;
-                      boolean audioOutput = false;
-
-                      for (
-                          int i = 0;
-                          i < dac.getInterfaceCount();
-                          i++
-                      ) {
-
-                          UsbInterface intf =
-                              dac.getInterface(i);
-
-                          Log.i(
-                              TAG,
-                              "Interface=" + intf.getId() +
-                              " alt=" + intf.getAlternateSetting() +
-                              " class=" + intf.getInterfaceClass() +
-                              " subclass=" + intf.getInterfaceSubclass() +
-                              " protocol=" + intf.getInterfaceProtocol()
-                          );
-
-                          boolean uac2 =
-                              intf.getInterfaceClass() == 1 &&
-                              intf.getInterfaceProtocol() == 0x20;
-
-                          if (
-                              uac2 &&
-                              intf.getInterfaceSubclass() == 1
-                          ) {
-
-                              audioControl = true;
-
-                          }
-
-                          for (
-                              int j = 0;
-                              j < intf.getEndpointCount();
-                              j++
-                          ) {
-
-                              UsbEndpoint ep =
-                                  intf.getEndpoint(j);
-
-                              Log.i(
-                                  TAG,
-                                  String.format(
-                                      "Endpoint=0x%02x type=%d maxPacket=%d interval=%d",
-                                      ep.getAddress(),
-                                      ep.getType(),
-                                      ep.getMaxPacketSize(),
-                                      ep.getInterval()
-                                  )
-                              );
-
-                              if (
-                                  uac2 &&
-                                  intf.getInterfaceSubclass() == 2 &&
-                                  ep.getType() ==
-                                      UsbConstants.USB_ENDPOINT_XFER_ISOC &&
-                                  ep.getDirection() ==
-                                      UsbConstants.USB_DIR_OUT
-                              ) {
-
-                                  audioOutput = true;
-
-                              }
-                          }
-                      }
-
-                      if (!audioControl || !audioOutput) {
-
-                          report("M1_FAIL: UAC2 interfaces missing");
-                          return;
-
-                      }
-
-                      if (!manager.hasPermission(dac)) {
-
-                          report(
-                              "DX3 Pro+ detected. USB permission required."
-                          );
-
-                          if (requestPermission) {
-
-                              PendingIntent pi =
-                                  PendingIntent.getBroadcast(
-                                      this,
-                                      0,
-                                      new Intent(permissionAction)
-                                          .setPackage(getPackageName()),
-                                      PendingIntent.FLAG_IMMUTABLE |
-                                      PendingIntent.FLAG_ONE_SHOT
-                                  );
-
-                              manager.requestPermission(dac, pi);
-
-                          }
-
-                          return;
-                      }
-
-                      UsbDeviceConnection connection =
-                          manager.openDevice(dac);
-
-                      if (connection == null) {
-
-                          report("M1_FAIL: openDevice returned null");
-                          return;
-
-                      }
-
-                      int fd;
-                      int descriptorLength;
-
-                      try {
-
-                          fd = connection.getFileDescriptor();
-
-                          byte[] raw =
-                              connection.getRawDescriptors();
-
-                          descriptorLength =
-                              raw == null ? 0 : raw.length;
-
-                      } finally {
-
-                          connection.close();
-
-                      }
-
-                      if (fd < 0) {
-
-                          report("M1_FAIL: invalid file descriptor");
-                          return;
-
-                      }
-
-                      report(
-                          "M1_PASS: TOPPING DX3 Pro+\n" +
-                          "VID/PID: 152A:8750\n" +
-                          "UAC2: confirmed\n" +
-                          "Permission: granted\n" +
-                          "USB fd: " + fd + "\n" +
-                          "Descriptors: " + descriptorLength + " bytes\n" +
-                          "USB connection closed safely."
-                      );
-
-                  } catch (Exception e) {
-
-                      Log.e(TAG, "M1 exception", e);
-
-                      report("M1_FAIL: " + e.toString());
-
+                      manager.requestPermission(device, pi);
                   }
               }
 
               @Override
-              protected void onDestroy() {
-
-                  if (registered) {
-
+              public void onDestroy()
+              {
+                  if (registered)
                       unregisterReceiver(receiver);
-
-                  }
 
                   super.onDestroy();
               }
           }
           JAVA
 
+      - name: Implement native USB Direct sink
+        working-directory: kodi
+        run: |
+          SINK="xbmc/cores/AudioEngine/Sinks"
+
+          cat > "$SINK/AESinkUSBDirect.h" <<'CPP'
+          #pragma once
+
+          void RegisterDirectUsbSink();
+          CPP
+
+          cat > "$SINK/AESinkUSBDirect.cpp" <<'CPP'
+          #include "AESinkUSBDirect.h"
+
+          #include "cores/AudioEngine/Interfaces/AESink.h"
+          #include "cores/AudioEngine/AESinkFactory.h"
+          #include "cores/AudioEngine/Utils/AEDeviceInfo.h"
+          #include "platform/android/activity/XBMCApp.h"
+
+          #include <androidjni/JNIThreading.h>
+          #include <android/log.h>
+          #include <jni.h>
+          #include <libusb.h>
+          #include <unistd.h>
+
+          #include <algorithm>
+          #include <array>
+          #include <atomic>
+          #include <chrono>
+          #include <condition_variable>
+          #include <cstdint>
+          #include <cstring>
+          #include <limits>
+          #include <mutex>
+          #include <thread>
+          #include <vector>
+
+          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, \
+              "KodiDirectUSB", __VA_ARGS__)
+          #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, \
+              "KodiDirectUSB", __VA_ARGS__)
+
+          using namespace jni;
+          using namespace std::chrono_literals;
+
+          namespace
+          {
+          constexpr uint16_t VID = 0x152a;
+          constexpr uint16_t PID = 0x8750;
+
+          constexpr int AC = 0;
+          constexpr int AS = 1;
+          constexpr int ALT = 2;
+
+          constexpr uint8_t CLOCK = 0x29;
+          constexpr uint8_t EP_OUT = 0x01;
+          constexpr uint8_t EP_FB = 0x81;
+
+          constexpr int PACKETS = 8;
+          constexpr int DATA_SLOTS = 8;
+          constexpr int FB_SLOTS = 2;
+          constexpr unsigned FRAME_BYTES = 8;
+
+          const std::vector<unsigned> RATES{
+              44100, 48000, 88200, 96000, 176400, 192000
+          };
+
+          int JavaCall(const char* method)
+          {
+              JNIEnv* env = xbmc_jnienv();
+
+              if (!env)
+                  return -1;
+
+              auto* activity =
+                  CXBMCApp::Get().GetDirectUsbActivity();
+
+              if (!activity || !activity->clazz)
+                  return -1;
+
+              jobject obj = activity->clazz;
+              jclass cls = env->GetObjectClass(obj);
+
+              if (!cls)
+              {
+                  env->ExceptionClear();
+                  return -1;
+              }
+
+              jmethodID id =
+                  env->GetMethodID(cls, method, "()I");
+
+              if (!id)
+              {
+                  env->ExceptionClear();
+                  env->DeleteLocalRef(cls);
+                  return -1;
+              }
+
+              int result = env->CallIntMethod(obj, id);
+
+              if (env->ExceptionCheck())
+              {
+                  env->ExceptionClear();
+                  result = -1;
+              }
+
+              env->DeleteLocalRef(cls);
+              return result;
+          }
+
+          uint32_t ReadLE32(const unsigned char* p)
+          {
+              return uint32_t(p[0]) |
+                    (uint32_t(p[1]) << 8) |
+                    (uint32_t(p[2]) << 16) |
+                    (uint32_t(p[3]) << 24);
+          }
+
+          class DirectSink final : public IAESink
+          {
+              struct Slot
+              {
+                  DirectSink* owner = nullptr;
+                  libusb_transfer* transfer = nullptr;
+                  std::vector<unsigned char> buffer;
+                  bool feedback = false;
+                  bool active = false;
+                  unsigned realFrames = 0;
+              };
+
+          public:
+              ~DirectSink() override
+              {
+                  Deinitialize();
+              }
+
+              const char* GetName() override
+              {
+                  return "USBDIRECT";
+              }
+
+              bool Initialize(
+                  AEAudioFormat& format,
+                  std::string& device) override
+              {
+                  if (format.m_dataFormat == AE_FMT_RAW)
+                      return false;
+
+                  m_rate = format.m_sampleRate;
+
+                  if (std::find(
+                      RATES.begin(), RATES.end(), m_rate)
+                      == RATES.end())
+                  {
+                      m_rate = 48000;
+                  }
+
+                  m_fd = JavaCall("directUsbOpen");
+
+                  if (m_fd < 0)
+                      return Fail("USB authorization/open", m_fd);
+
+                  int rc = libusb_set_option(
+                      nullptr, LIBUSB_OPTION_NO_DEVICE_DISCOVERY);
+
+                  if (rc != LIBUSB_SUCCESS)
+                      return Fail("libusb option", rc);
+
+                  rc = libusb_init(&m_context);
+
+                  if (rc != LIBUSB_SUCCESS)
+                      return Fail("libusb_init", rc);
+
+                  rc = libusb_wrap_sys_device(
+                      m_context, intptr_t(m_fd), &m_handle);
+
+                  if (rc != LIBUSB_SUCCESS)
+                      return Fail("wrap USB fd", rc);
+
+                  if (!CheckDescriptors())
+                      return Fail("Unsupported USB descriptors", -1);
+
+                  rc = libusb_set_auto_detach_kernel_driver(
+                      m_handle, 1);
+
+                  if (rc != LIBUSB_SUCCESS)
+                      return Fail("auto detach", rc);
+
+                  rc = libusb_claim_interface(m_handle, AC);
+
+                  if (rc != LIBUSB_SUCCESS)
+                      return Fail("claim AC", rc);
+
+                  m_acClaimed = true;
+
+                  rc = libusb_claim_interface(m_handle, AS);
+
+                  if (rc != LIBUSB_SUCCESS)
+                      return Fail("claim AS", rc);
+
+                  m_asClaimed = true;
+
+                  rc = libusb_set_interface_alt_setting(
+                      m_handle, AS, 0);
+
+                  if (rc != LIBUSB_SUCCESS)
+                      return Fail("set alt 0", rc);
+
+                  if (!SetClock(m_rate))
+                      return Fail("clock SET_CUR", -1);
+
+                  rc = libusb_set_interface_alt_setting(
+                      m_handle, AS, ALT);
+
+                  if (rc != LIBUSB_SUCCESS)
+                      return Fail("set alt 2", rc);
+
+                  bool clockOK = false;
+
+                  for (int i = 0; i < 10; ++i)
+                  {
+                      if (ReadClock() == m_rate)
+                      {
+                          clockOK = true;
+                          break;
+                      }
+
+                      std::this_thread::sleep_for(30ms);
+                  }
+
+                  if (!clockOK)
+                      return Fail("clock readback mismatch", -1);
+
+                  format.m_sampleRate = m_rate;
+                  format.m_dataFormat = AE_FMT_S24NE4MSB;
+                  format.m_channelLayout = AE_CH_LAYOUT_2_0;
+                  format.m_frameSize = FRAME_BYTES;
+                  format.m_frames = m_rate / 100;
+
+                  device = "DX3PROPLUS";
+
+                  m_capacity = m_rate / 10;
+
+                  m_ring.assign(
+                      size_t(m_capacity) * FRAME_BYTES, 0);
+
+                  m_read = m_write = m_count = m_queued = 0;
+
+                  m_nominal =
+                      uint32_t((uint64_t(m_rate) * 65536 + 4000) /
+                               8000);
+
+                  m_step = m_nominal;
+                  m_phase = 0;
+
+                  for (size_t i = 0; i < m_slots.size(); ++i)
+                  {
+                      auto& slot = m_slots[i];
+
+                      slot.owner = this;
+                      slot.feedback = i >= DATA_SLOTS;
+                      slot.active = false;
+                      slot.realFrames = 0;
+
+                      int packetSize =
+                          slot.feedback ? 4 : m_maxPacket;
+
+                      slot.buffer.resize(
+                          PACKETS * packetSize);
+
+                      slot.transfer =
+                          libusb_alloc_transfer(PACKETS);
+
+                      if (!slot.transfer)
+                          return Fail("alloc transfer", -1);
+
+                      libusb_fill_iso_transfer(
+                          slot.transfer,
+                          m_handle,
+                          slot.feedback ? EP_FB : EP_OUT,
+                          slot.buffer.data(),
+                          int(slot.buffer.size()),
+                          PACKETS,
+                          &DirectSink::Callback,
+                          &slot,
+                          0);
+                  }
+
+                  m_run.store(true);
+
+                  for (auto& slot : m_slots)
+                  {
+                      if (!Submit(slot))
+                      {
+                          if (slot.feedback)
+                          {
+                              LOGE("Feedback submit failed; "
+                                   "using nominal timing until "
+                                   "feedback becomes available");
+                              continue;
+                          }
+
+                          m_run.store(false);
+                          return Fail("start PCM transfers", -1);
+                      }
+                  }
+
+                  try
+                  {
+                      m_worker = std::thread(
+                          &DirectSink::EventLoop, this);
+                  }
+                  catch (...)
+                  {
+                      m_run.store(false);
+                      return Fail("event thread", -1);
+                  }
+
+                  LOGI("M2_READY: rate=%u bits=24 "
+                       "subslot=4 channels=2",
+                       m_rate);
+
+                  return true;
+              }
+
+              void Deinitialize() override
+              {
+                  m_run.store(false);
+                  m_cv.notify_all();
+
+                  if (m_worker.joinable())
+                      m_worker.join();
+                  else if (m_inFlight > 0 && m_context)
+                      EventLoop();
+
+                  for (auto& slot : m_slots)
+                  {
+                      if (slot.transfer)
+                      {
+                          libusb_free_transfer(slot.transfer);
+                          slot.transfer = nullptr;
+                      }
+
+                      slot.buffer.clear();
+                      slot.active = false;
+                  }
+
+                  if (m_handle)
+                  {
+                      if (m_asClaimed)
+                      {
+                          libusb_set_interface_alt_setting(
+                              m_handle, AS, 0);
+
+                          libusb_release_interface(
+                              m_handle, AS);
+                      }
+
+                      if (m_acClaimed)
+                          libusb_release_interface(
+                              m_handle, AC);
+
+                      if (m_acClaimed &&
+                          libusb_kernel_driver_active(
+                              m_handle, AC) == 0)
+                      {
+                          libusb_attach_kernel_driver(
+                              m_handle, AC);
+                      }
+
+                      if (m_asClaimed &&
+                          libusb_kernel_driver_active(
+                              m_handle, AS) == 0)
+                      {
+                          libusb_attach_kernel_driver(
+                              m_handle, AS);
+                      }
+
+                      libusb_close(m_handle);
+                      m_handle = nullptr;
+                  }
+
+                  if (m_context)
+                  {
+                      libusb_exit(m_context);
+                      m_context = nullptr;
+                  }
+
+                  if (m_fd >= 0)
+                  {
+                      close(m_fd);
+                      m_fd = -1;
+                      LOGI("M2_RELEASE: USB closed");
+                  }
+
+                  m_acClaimed = m_asClaimed = false;
+                  m_ring.clear();
+              }
+
+              double GetCacheTotal() override
+              {
+                  if (!m_rate)
+                      return 0.0;
+
+                  return double(m_capacity) /
+                         double(m_rate) + 0.008;
+              }
+
+              void GetDelay(AEDelayStatus& status) override
+              {
+                  std::lock_guard<std::mutex> lock(m_mutex);
+
+                  status.SetDelay(
+                      m_rate
+                          ? double(m_count + m_queued) /
+                            double(m_rate)
+                          : 0.0);
+              }
+
+              unsigned AddPackets(
+                  uint8_t** data,
+                  unsigned frames,
+                  unsigned offset) override
+              {
+                  if (!m_run.load())
+                      return std::numeric_limits<unsigned>::max();
+
+                  if (!data || !data[0] || !frames)
+                      return 0;
+
+                  std::unique_lock<std::mutex> lock(m_mutex);
+
+                  m_cv.wait_for(
+                      lock, 30ms,
+                      [this] {
+                          return !m_run.load() ||
+                                 m_count < m_capacity;
+                      });
+
+                  if (!m_run.load())
+                      return std::numeric_limits<unsigned>::max();
+
+                  unsigned accepted = std::min(
+                      frames, m_capacity - m_count);
+
+                  const uint8_t* src =
+                      data[0] + size_t(offset) * FRAME_BYTES;
+
+                  for (unsigned i = 0; i < accepted; ++i)
+                  {
+                      uint8_t* dst =
+                          m_ring.data() +
+                          size_t(m_write) * FRAME_BYTES;
+
+                      std::memcpy(
+                          dst,
+                          src + size_t(i) * FRAME_BYTES,
+                          FRAME_BYTES);
+
+                      // 24 meaningful bits, left aligned
+                      // in each little-endian 32-bit subslot.
+                      dst[0] = 0;
+                      dst[4] = 0;
+
+                      m_write = (m_write + 1) % m_capacity;
+                  }
+
+                  m_count += accepted;
+
+                  if (accepted && !m_loggedPCM)
+                  {
+                      m_loggedPCM = true;
+
+                      LOGI("M2_PCM: accepted=%u rate=%u",
+                           accepted, m_rate);
+                  }
+
+                  return accepted;
+              }
+
+              void Drain() override
+              {
+                  std::unique_lock<std::mutex> lock(m_mutex);
+
+                  m_cv.wait_for(
+                      lock, 500ms,
+                      [this] {
+                          return !m_run.load() ||
+                                 (m_count == 0 &&
+                                  m_queued == 0);
+                      });
+              }
+
+          private:
+              bool Fail(const char* where, int error)
+              {
+                  LOGE("M2_FAIL: %s error=%d", where, error);
+                  return false;
+              }
+
+              bool CheckDescriptors()
+              {
+                  libusb_device* dev =
+                      libusb_get_device(m_handle);
+
+                  libusb_device_descriptor dd{};
+
+                  if (libusb_get_device_descriptor(dev, &dd) != 0)
+                      return false;
+
+                  if (dd.idVendor != VID || dd.idProduct != PID)
+                      return false;
+
+                  if (libusb_get_device_speed(dev) !=
+                      LIBUSB_SPEED_HIGH)
+                      return false;
+
+                  libusb_config_descriptor* cfg = nullptr;
+
+                  if (libusb_get_active_config_descriptor(
+                      dev, &cfg) != 0)
+                      return false;
+
+                  bool clock = false;
+                  bool format = false;
+                  bool stereo = false;
+                  bool out = false;
+                  bool feedback = false;
+
+                  for (int i = 0; i < cfg->bNumInterfaces; ++i)
+                  {
+                      const auto& intf = cfg->interface[i];
+
+                      for (int j = 0;
+                           j < intf.num_altsetting; ++j)
+                      {
+                          const auto& a = intf.altsetting[j];
+
+                          if (a.bInterfaceClass != 1 ||
+                              a.bInterfaceProtocol != 0x20)
+                              continue;
+
+                          bool isAC =
+                              a.bInterfaceNumber == AC &&
+                              a.bInterfaceSubClass == 1;
+
+                          bool isAS =
+                              a.bInterfaceNumber == AS &&
+                              a.bInterfaceSubClass == 2 &&
+                              a.bAlternateSetting == ALT;
+
+                          if (!isAC && !isAS)
+                              continue;
+
+                          const unsigned char* p = a.extra;
+                          int left = a.extra_length;
+
+                          while (left >= 3 &&
+                                 p[0] >= 3 &&
+                                 p[0] <= left)
+                          {
+                              int len = p[0];
+
+                              if (p[1] == 0x24)
+                              {
+                                  if (isAC && len >= 8 &&
+                                      p[2] == 0x0a &&
+                                      p[3] == CLOCK)
+                                      clock = true;
+
+                                  if (isAS && len >= 6 &&
+                                      p[2] == 2 &&
+                                      p[3] == 1 &&
+                                      p[4] == 4 &&
+                                      p[5] == 24)
+                                      format = true;
+
+                                  if (isAS && len >= 11 &&
+                                      p[2] == 1 &&
+                                      p[10] == 2)
+                                      stereo = true;
+                              }
+
+                              p += len;
+                              left -= len;
+                          }
+
+                          if (isAS)
+                          {
+                              for (int k = 0;
+                                   k < a.bNumEndpoints; ++k)
+                              {
+                                  const auto& ep = a.endpoint[k];
+
+                                  if ((ep.bmAttributes & 3) != 1)
+                                      continue;
+
+                                  if (ep.bEndpointAddress ==
+                                      EP_OUT && ep.bInterval == 1)
+                                  {
+                                      m_maxPacket =
+                                          ep.wMaxPacketSize & 0x7ff;
+
+                                      out = m_maxPacket > 0;
+                                  }
+
+                                  if (ep.bEndpointAddress ==
+                                      EP_FB &&
+                                      (ep.wMaxPacketSize & 0x7ff)
+                                          >= 4 &&
+                                      ep.bInterval == 4)
+                                      feedback = true;
+                              }
+                          }
+                      }
+                  }
+
+                  libusb_free_config_descriptor(cfg);
+
+                  LOGI("Descriptor check: clock=%d format=%d "
+                       "stereo=%d out=%d feedback=%d max=%d",
+                       clock, format, stereo, out,
+                       feedback, m_maxPacket);
+
+                  return clock && format && stereo &&
+                         out && feedback;
+              }
+
+              bool SetClock(unsigned rate)
+              {
+                  unsigned char value[4]{
+                      uint8_t(rate),
+                      uint8_t(rate >> 8),
+                      uint8_t(rate >> 16),
+                      uint8_t(rate >> 24)
+                  };
+
+                  int rc = libusb_control_transfer(
+                      m_handle,
+                      0x21, 0x01, 0x0100,
+                      uint16_t((CLOCK << 8) | AC),
+                      value, 4, 1000);
+
+                  LOGI("SET_CUR rate=%u result=%d", rate, rc);
+
+                  return rc == 4;
+              }
+
+              unsigned ReadClock()
+              {
+                  unsigned char value[4]{};
+
+                  int rc = libusb_control_transfer(
+                      m_handle,
+                      0xa1, 0x01, 0x0100,
+                      uint16_t((CLOCK << 8) | AC),
+                      value, 4, 1000);
+
+                  unsigned rate =
+                      rc == 4 ? ReadLE32(value) : 0;
+
+                  LOGI("GET_CUR rate=%u result=%d", rate, rc);
+
+                  return rate;
+              }
+
+              bool Submit(Slot& slot)
+              {
+                  auto* transfer = slot.transfer;
+
+                  if (slot.feedback)
+                  {
+                      libusb_set_iso_packet_lengths(
+                          transfer, 4);
+
+                      transfer->length = PACKETS * 4;
+                  }
+                  else
+                  {
+                      std::lock_guard<std::mutex> lock(m_mutex);
+
+                      unsigned total = 0;
+                      slot.realFrames = 0;
+
+                      for (int i = 0; i < PACKETS; ++i)
+                      {
+                          m_phase += m_step;
+
+                          unsigned frames = m_phase >> 16;
+                          m_phase &= 0xffff;
+
+                          unsigned bytes =
+                              frames * FRAME_BYTES;
+
+                          if (bytes > unsigned(m_maxPacket))
+                              return false;
+
+                          transfer->iso_packet_desc[i].length =
+                              bytes;
+
+                          uint8_t* dst =
+                              slot.buffer.data() + total;
+
+                          std::memset(dst, 0, bytes);
+
+                          unsigned available =
+                              std::min(frames, m_count);
+
+                          for (unsigned f = 0;
+                               f < available; ++f)
+                          {
+                              std::memcpy(
+                                  dst + size_t(f) * FRAME_BYTES,
+                                  m_ring.data() +
+                                      size_t(m_read) * FRAME_BYTES,
+                                  FRAME_BYTES);
+
+                              m_read =
+                                  (m_read + 1) % m_capacity;
+                          }
+
+                          m_count -= available;
+                          slot.realFrames += available;
+                          total += bytes;
+                      }
+
+                      transfer->length = total;
+                      m_queued += slot.realFrames;
+                      m_cv.notify_all();
+                  }
+
+                  int rc = libusb_submit_transfer(transfer);
+
+                  if (rc != LIBUSB_SUCCESS)
+                  {
+                      if (!slot.feedback)
+                      {
+                          std::lock_guard<std::mutex> lock(m_mutex);
+
+                          m_queued -= slot.realFrames;
+                          slot.realFrames = 0;
+                      }
+
+                      LOGE("submit failed ep=%02x rc=%d",
+                           transfer->endpoint, rc);
+
+                      return false;
+                  }
+
+                  slot.active = true;
+                  ++m_inFlight;
+
+                  return true;
+              }
+
+              static void LIBUSB_CALL Callback(
+                  libusb_transfer* transfer)
+              {
+                  auto* slot =
+                      static_cast<Slot*>(transfer->user_data);
+
+                  slot->owner->Complete(*slot);
+              }
+
+              void Complete(Slot& slot)
+              {
+                  slot.active = false;
+                  --m_inFlight;
+
+                  if (!slot.feedback)
+                  {
+                      std::lock_guard<std::mutex> lock(m_mutex);
+
+                      m_queued -= slot.realFrames;
+                      slot.realFrames = 0;
+                  }
+
+                  m_cv.notify_all();
+
+                  if (!m_run.load())
+                      return;
+
+                  auto* transfer = slot.transfer;
+
+                  if (transfer->status !=
+                      LIBUSB_TRANSFER_COMPLETED)
+                  {
+                      LOGE("Transfer status=%d ep=%02x",
+                           transfer->status,
+                           transfer->endpoint);
+
+                      if (!slot.feedback ||
+                          transfer->status ==
+                              LIBUSB_TRANSFER_NO_DEVICE)
+                          m_run.store(false);
+
+                      return;
+                  }
+
+                  if (slot.feedback)
+                  {
+                      for (int i = 0; i < PACKETS; ++i)
+                      {
+                          const auto& desc =
+                              transfer->iso_packet_desc[i];
+
+                          if (desc.status !=
+                                  LIBUSB_TRANSFER_COMPLETED ||
+                              desc.actual_length != 4)
+                              continue;
+
+                          unsigned char* p =
+                              libusb_get_iso_packet_buffer_simple(
+                                  transfer, i);
+
+                          uint32_t value = ReadLE32(p);
+
+                          if (value >= m_nominal * 98 / 100 &&
+                              value <= m_nominal * 102 / 100)
+                          {
+                              m_step = uint32_t(
+                                  (uint64_t(m_step) * 7 +
+                                   value) / 8);
+
+                              if (!m_loggedFeedback)
+                              {
+                                  m_loggedFeedback = true;
+
+                                  LOGI("M2_FEEDBACK: "
+                                       "value=%u nominal=%u",
+                                       value, m_nominal);
+                              }
+                          }
+                      }
+                  }
+                  else
+                  {
+                      for (int i = 0; i < PACKETS; ++i)
+                      {
+                          if (transfer->iso_packet_desc[i].status
+                              != LIBUSB_TRANSFER_COMPLETED)
+                          {
+                              LOGE("ISO OUT packet error");
+                              m_run.store(false);
+                              return;
+                          }
+                      }
+                  }
+
+                  if (!Submit(slot) && !slot.feedback)
+                      m_run.store(false);
+              }
+
+              void EventLoop()
+              {
+                  bool cancelled = false;
+
+                  while (m_inFlight > 0)
+                  {
+                      if (!m_run.load() && !cancelled)
+                      {
+                          cancelled = true;
+
+                          for (auto& slot : m_slots)
+                          {
+                              if (slot.active)
+                                  libusb_cancel_transfer(
+                                      slot.transfer);
+                          }
+                      }
+
+                      timeval tv{0, 20000};
+
+                      int rc =
+                          libusb_handle_events_timeout_completed(
+                              m_context, &tv, nullptr);
+
+                      if (rc < 0 &&
+                          rc != LIBUSB_ERROR_INTERRUPTED)
+                      {
+                          LOGE("USB event error=%d", rc);
+                          m_run.store(false);
+                      }
+                  }
+
+                  m_run.store(false);
+                  m_cv.notify_all();
+              }
+
+              int m_fd = -1;
+
+              libusb_context* m_context = nullptr;
+              libusb_device_handle* m_handle = nullptr;
+
+              bool m_acClaimed = false;
+              bool m_asClaimed = false;
+              bool m_loggedFeedback = false;
+              bool m_loggedPCM = false;
+
+              int m_maxPacket = 0;
+              int m_inFlight = 0;
+
+              unsigned m_rate = 0;
+              unsigned m_capacity = 0;
+              unsigned m_read = 0;
+              unsigned m_write = 0;
+              unsigned m_count = 0;
+              unsigned m_queued = 0;
+
+              uint32_t m_nominal = 0;
+              uint32_t m_step = 0;
+              uint32_t m_phase = 0;
+
+              std::vector<uint8_t> m_ring;
+
+              std::array<Slot, DATA_SLOTS + FB_SLOTS> m_slots;
+
+              std::mutex m_mutex;
+              std::condition_variable m_cv;
+              std::atomic<bool> m_run{false};
+              std::thread m_worker;
+          };
+
+          IAESink* Create(
+              std::string& device,
+              AEAudioFormat& format)
+          {
+              auto* sink = new DirectSink();
+
+              if (sink->Initialize(format, device))
+                  return sink;
+
+              delete sink;
+              return nullptr;
+          }
+
+          void Enumerate(AEDeviceInfoList& list, bool)
+          {
+              if (JavaCall("directUsbPresent") != 1)
+                  return;
+
+              CAEDeviceInfo info{};
+
+              info.m_deviceName = "DX3PROPLUS";
+              info.m_displayName = "TOPPING DX3 Pro+";
+              info.m_displayNameExtra =
+                  "Direct USB PCM - Experimental";
+
+              info.m_deviceType = AE_DEVTYPE_PCM;
+              info.m_channels = AE_CH_LAYOUT_2_0;
+              info.m_sampleRates = RATES;
+
+              info.m_dataFormats.push_back(
+                  AE_FMT_S24NE4MSB);
+
+              info.m_onlyPCM = true;
+              info.m_wantsIECPassthrough = false;
+
+              list.push_back(info);
+
+              LOGI("M2_ENUMERATE: DX3 Pro+");
+          }
+          }
+
+          void RegisterDirectUsbSink()
+          {
+              AE::AESinkRegEntry entry;
+
+              entry.sinkName = "USBDIRECT";
+              entry.createFunc = Create;
+              entry.enumerateFunc = Enumerate;
+
+              AE::CAESinkFactory::RegisterSink(entry);
+
+              LOGI("M2_REGISTER: USBDIRECT");
+          }
+          CPP
+
+      - name: Register new Kodi audio backend
+        working-directory: kodi
+        run: |
           python3 - <<'PY'
           from pathlib import Path
 
-          manifest = Path(
-              "tools/android/packaging/xbmc/AndroidManifest.xml.in"
+          p = Path(
+              "xbmc/platform/android/activity/XBMCApp.h"
           )
 
-          text = manifest.read_text()
+          s = p.read_text()
 
-          marker = "</application>"
-
-          assert text.count(marker) == 1
-
-          activity = '''
-              <activity
-                  android:name=".UsbDirectProbe"
-                  android:label="Direct USB Diagnostic"
-                  android:screenOrientation="landscape"
-                  android:permission="android.permission.DUMP"
-                  android:exported="true" />
-          '''
-
-          manifest.write_text(
-              text.replace(marker, activity + marker, 1)
+          marker = (
+              "static CXBMCApp& Get() "
+              "{ return *m_appinstance; }"
           )
 
-          cmake = Path("cmake/scripts/android/Install.cmake")
+          assert s.count(marker) == 1
 
-          text = cmake.read_text()
+          p.write_text(s.replace(
+              marker,
+              marker + "\n"
+              "  ANativeActivity* GetDirectUsbActivity() const "
+              "{ return m_activity; }",
+              1
+          ))
 
-          marker = "src/Main.java"
+          p = Path(
+              "xbmc/platform/android/activity/XBMCApp.cpp"
+          )
 
-          assert text.count(marker) == 1
+          s = p.read_text()
 
-          cmake.write_text(
-              text.replace(
-                  marker,
-                  marker + "\n                  src/UsbDirectProbe.java",
-                  1
+          marker = (
+              '#include '
+              '"cores/AudioEngine/Sinks/AESinkAUDIOTRACK.h"'
+          )
+
+          assert s.count(marker) == 1
+
+          s = s.replace(
+              marker,
+              marker + '\n#include '
+              '"cores/AudioEngine/Sinks/AESinkUSBDirect.h"',
+              1
+          )
+
+          marker = "CAESinkAUDIOTRACK::Register();"
+
+          assert s.count(marker) == 1
+
+          s = s.replace(
+              marker,
+              marker + "\n    RegisterDirectUsbSink();",
+              1
+          )
+
+          p.write_text(s)
+
+          p = Path("xbmc/cores/AudioEngine/CMakeLists.txt")
+          s = p.read_text()
+
+          marker = "list(APPEND SOURCES Sinks/AESinkAUDIOTRACK.cpp)"
+          assert s.count(marker) == 1
+
+          s = s.replace(
+              marker,
+              "list(APPEND SOURCES "
+              "Sinks/AESinkAUDIOTRACK.cpp "
+              "Sinks/AESinkUSBDirect.cpp)",
+              1
+          )
+
+          marker = "core_add_library(audioengine)"
+
+          assert s.count(marker) == 1
+
+          s = s.replace(
+              marker,
+              marker + '''
+          if(CORE_SYSTEM_NAME STREQUAL android)
+            target_include_directories(
+              ${CORE_LIBRARY} PRIVATE
+              "${CMAKE_SOURCE_DIR}/directusb")
+          endif()
+          ''',
+              1
+          )
+
+          p.write_text(s)
+
+          p = Path("cmake/scripts/android/ArchSetup.cmake")
+
+          with p.open("a") as f:
+              f.write(
+                  '\nlist(APPEND DEPLIBS '
+                  '"${CMAKE_SOURCE_DIR}/directusb/'
+                  'libusb-1.0.a")\n'
               )
-          )
 
-          print("M1 USB probe added to Android packaging")
+          print("M2 source integration complete")
           PY
 
       - name: Configure Kodi
@@ -519,19 +1512,18 @@ jobs:
 
       - name: Verify APK
         run: |
-          APK=$(find kodi -name 'kodiapp-*.apk' -print -quit)
+          APK=$(find kodi "$RUNNER_TEMP/kodi-build" \
+            -name 'kodiapp-*.apk' -print -quit)
 
           test -n "$APK"
 
           mkdir -p output
 
-          cp "$APK" output/Maven-20.5-DirectUSB-M1.apk
+          cp "$APK" output/Maven-20.5-DirectUSB-M2.apk
 
           "$ANDROID_HOME/build-tools/30.0.3/aapt" \
             dump badging output/*.apk \
             > output/apk-info.txt
-
-          cat output/apk-info.txt
 
           grep -F "package: name='org.xbmc.kodi.directusb'" \
             output/apk-info.txt
@@ -539,18 +1531,16 @@ jobs:
           unzip -l output/*.apk | \
             grep 'lib/armeabi-v7a/libkodi.so'
 
-          "$ANDROID_HOME/build-tools/30.0.3/aapt" \
-            dump xmltree \
-            output/Maven-20.5-DirectUSB-M1.apk \
-            AndroidManifest.xml \
-            > output/manifest-info.txt
+          unzip -p output/Maven-20.5-DirectUSB-M2.apk \
+            lib/armeabi-v7a/libkodi.so > /tmp/libkodi-m2.so
 
-          grep -F "UsbDirectProbe" \
-            output/manifest-info.txt
+          strings /tmp/libkodi-m2.so | grep -F "M2_READY"
+
+          cp kodi/directusb/libusb-COPYING output/
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: Maven-20.5-DirectUSB-M1
+          name: Maven-20.5-DirectUSB-M2
           path: output/
           if-no-files-found: error
