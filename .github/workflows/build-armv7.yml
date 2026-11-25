@@ -1,0 +1,130 @@
+
+name: Maven 20.5 Direct USB ARMv7
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout Maven 20.5
+        uses: actions/checkout@v5
+        with:
+          repository: Maven85/kodi
+          ref: e00e52ee98f05b241d55aa9aff25e08130cac04f
+          path: kodi
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            autoconf automake libtool bison flex \
+            build-essential curl gawk gperf \
+            lib32stdc++6 lib32z1 lib32z1-dev \
+            libcurl4-openssl-dev unzip zip \
+            zlib1g-dev pkg-config gettext \
+            nasm yasm ccache python3 cmake
+
+          sdkmanager --install \
+            "platforms;android-33" \
+            "build-tools;30.0.3" \
+            "ndk;21.4.7075529"
+
+      - name: Configure independent package
+        working-directory: kodi
+        run: |
+          sed -i 's/^APP_PACKAGE .*/APP_PACKAGE org.xbmc.kodi.directusb/' version.txt
+
+          sed -i 's/>@APP_NAME@</>Kodi Direct USB</g' \
+            tools/android/packaging/xbmc/strings.xml.in
+
+          cat version.txt
+
+      - name: Generate signing key
+        run: |
+          mkdir -p "$HOME/.android"
+          if [ ! -f "$HOME/.android/debug.keystore" ]; then
+            keytool -genkeypair \
+              -keystore "$HOME/.android/debug.keystore" \
+              -alias androiddebugkey \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -storepass android \
+              -keypass android \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+      - name: Configure ARMv7
+        working-directory: kodi/tools/depends
+        run: |
+          ./bootstrap
+          ./configure \
+            --host=arm-linux-androideabi \
+            --with-sdk-path="$ANDROID_HOME" \
+            --with-ndk-path="$ANDROID_HOME/ndk/21.4.7075529" \
+            --with-ndk-api=21 \
+            --with-tarballs="$HOME/kodi-tarballs" \
+            --prefix="$HOME/kodi-depends" \
+            --enable-debug=no
+
+      - name: Build dependencies
+        working-directory: kodi/tools/depends
+        run: |
+          make -j2
+          df -h
+
+      - name: Configure Kodi
+        working-directory: kodi
+        run: |
+          mkdir -p "$RUNNER_TEMP/kodi-build"
+          make -C tools/depends/target/cmakebuildsys \
+            BUILD_DIR="$RUNNER_TEMP/kodi-build"
+
+      - name: Compile Kodi
+        run: |
+          make -C "$RUNNER_TEMP/kodi-build" -j2
+
+      - name: Package APK
+        run: |
+          make -C "$RUNNER_TEMP/kodi-build" apk
+
+      - name: Verify APK
+        run: |
+          APK=$(find kodi -name 'kodiapp-*.apk' -print -quit)
+          test -n "$APK"
+
+          mkdir -p output
+          cp "$APK" output/Maven-20.5-DirectUSB-M0.apk
+
+          "$ANDROID_HOME/build-tools/30.0.3/aapt" \
+            dump badging output/*.apk > output/apk-info.txt
+
+          cat output/apk-info.txt
+
+          grep -F "package: name='org.xbmc.kodi.directusb'" \
+            output/apk-info.txt
+
+          unzip -l output/*.apk | grep 'lib/armeabi-v7a/libkodi.so'
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Maven-20.5-DirectUSB-M0
+          path: output/
+          if-no-files-found: error
