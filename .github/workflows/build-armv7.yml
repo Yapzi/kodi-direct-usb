@@ -1,4 +1,4 @@
-name: Maven 20.5 Direct USB ARMv7 RC1
+name: Maven 20.5 Direct USB ARMv7 RC1-fix1
 on:
   workflow_dispatch:
 permissions:
@@ -51,47 +51,6 @@ jobs:
               -validity 10000 -storepass android -keypass android \
               -dname "CN=Android Debug,O=Android,C=US"
           fi
-      - name: Configure ARMv7
-        working-directory: kodi/tools/depends
-        run: |
-          test -f "$ANDROID_HOME/platforms/android-33/android.jar"
-          test -f "$ANDROID_HOME/ndk/21.4.7075529/source.properties"
-          python3 - <<'PY'
-          from pathlib import Path
-          p = Path('configure.ac')
-          s = p.read_text()
-          old = 'if [ ! test -f $use_sdk_path/tools/bin/sdkmanager ]; then'
-          new = 'if ! command -v sdkmanager >/dev/null 2>&1; then'
-          assert s.count(old) == 1
-          p.write_text(s.replace(old, new, 1))
-          PY
-          ./bootstrap
-          ./configure \
-            --host=arm-linux-androideabi \
-            --with-sdk-path="$ANDROID_HOME" \
-            --with-ndk-path="$ANDROID_HOME/ndk/21.4.7075529" \
-            --with-ndk-api=21 \
-            --with-tarballs="$HOME/kodi-tarballs" \
-            --prefix="$HOME/kodi-depends" \
-            --enable-debug=no
-      - name: Restore dependency cache
-        uses: actions/cache/restore@v4
-        id: dep-cache
-        with:
-          path: ~/kodi-depends
-          key: maven205-e00e52ee-armv7-ndk21e-ubuntu2204-v1
-      - name: Build dependencies
-        working-directory: kodi/tools/depends
-        if: steps.dep-cache.outputs.cache-hit != 'true'
-        run: |
-          make -j2
-          df -h
-      - name: Save dependency cache
-        uses: actions/cache/save@v4
-        if: steps.dep-cache.outputs.cache-hit != 'true'
-        with:
-          path: ~/kodi-depends
-          key: maven205-e00e52ee-armv7-ndk21e-ubuntu2204-v1
       - name: Write RC1 sources (part 10)
         working-directory: kodi
         run: |
@@ -937,21 +896,31 @@ jobs:
           assert s.count(marker)==1
           s=s.replace(marker,'if (m_extAppFocused)\n              m_extTimeout = (m_sink && std::string(m_sink->GetName()) == "USBDIRECT") ? 1s : 10s;')
           f.write_text(s)
-          replace(p,'m_sink = CAESinkFactory::Create(device, m_sinkFormat);\n  // try first device in out list',
-                  'm_sink = CAESinkFactory::Create(device, m_sinkFormat);\n  if (!m_sink && driver == "USBDIRECT")\n    CLog::Log(LOGWARNING, "Direct USB unavailable; trying normal Kodi fallback");\n  // try first device in out list')
+          # Keep the original Kodi fallback implementation. Do not match its comments.
           # Log decoded stream/requested output at the actual ActiveAE negotiation layer.
           p='xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.cpp'
-          marker='CAEAudioFormat oldSinkRequestFormat = m_sinkRequestFormat;'
-          assert marker in (root/p).read_text()
-          marker='ApplySettingsToFormat(m_sinkRequestFormat, m_settings, (int*)&m_mode);'
-          replace(p,marker,marker+'''
-            if (m_settings.device.find("USBDIRECT:") == 0)
-            {
-              CLog::Log(LOGINFO, "DirectUSB_SOURCE: decoded_rate={} decoded_format={} decoded_channels={} requested_rate={}",
-                        inputFormat.m_sampleRate, CAEUtil::DataFormatToStr(inputFormat.m_dataFormat),
-                        inputFormat.m_channelLayout.Count(), m_sinkRequestFormat.m_sampleRate);
-            }''')
-          print('RC1 overlay applied to the pinned source')
+          f=root/p
+          s=f.read_text()
+          # Match the Configure() negotiation statement independently of formatting.
+          pattern=r'(?m)^([ \t]*)ApplySettingsToFormat\s*\(\s*m_sinkRequestFormat\s*,\s*m_settings\s*,\s*\(\s*int\s*\*\s*\)\s*&m_mode\s*\)\s*;'
+          log_lines=[
+              'if (m_settings.device.find("USBDIRECT:") == 0)',
+              '{',
+              '  CLog::Log(LOGINFO, "DirectUSB_SOURCE: decoded_rate={} decoded_format={} decoded_channels={} requested_rate={}",',
+              '            inputFormat.m_sampleRate, CAEUtil::DataFormatToStr(inputFormat.m_dataFormat),',
+              '            inputFormat.m_channelLayout.Count(), m_sinkRequestFormat.m_sampleRate);',
+              '}',
+          ]
+          def add_source_log(m):
+              return m.group(0) + '\n' + '\n'.join(m.group(1)+line for line in log_lines)
+          s,n=re.subn(pattern,add_source_log,s)
+          if n==1:
+              f.write_text(s)
+              print('Source negotiation log added')
+          else:
+              # This log is diagnostic only; it must not block an otherwise valid build.
+              print(f'Optional source negotiation log skipped: found {n} matching statements')
+          print('RC1-fix1 overlay applied to the pinned source')
           RC1_SOURCE_6_0_EOF
 
           cat > xbmc/cores/AudioEngine/Sinks/AESinkUSBDirect.h <<'EOF'
@@ -964,6 +933,47 @@ jobs:
           python3 directusb/make_test_wavs.py "$RUNNER_TEMP/directusb-test-wavs"
           g++ -std=c++14 -Wall -Wextra -Werror directusb/UsbPcmMathTest.cpp -o "$RUNNER_TEMP/directusb-math-test"
           "$RUNNER_TEMP/directusb-math-test" "$RUNNER_TEMP/directusb-test-wavs"/*.wav
+      - name: Configure ARMv7
+        working-directory: kodi/tools/depends
+        run: |
+          test -f "$ANDROID_HOME/platforms/android-33/android.jar"
+          test -f "$ANDROID_HOME/ndk/21.4.7075529/source.properties"
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('configure.ac')
+          s = p.read_text()
+          old = 'if [ ! test -f $use_sdk_path/tools/bin/sdkmanager ]; then'
+          new = 'if ! command -v sdkmanager >/dev/null 2>&1; then'
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, new, 1))
+          PY
+          ./bootstrap
+          ./configure \
+            --host=arm-linux-androideabi \
+            --with-sdk-path="$ANDROID_HOME" \
+            --with-ndk-path="$ANDROID_HOME/ndk/21.4.7075529" \
+            --with-ndk-api=21 \
+            --with-tarballs="$HOME/kodi-tarballs" \
+            --prefix="$HOME/kodi-depends" \
+            --enable-debug=no
+      - name: Restore dependency cache
+        uses: actions/cache/restore@v4
+        id: dep-cache
+        with:
+          path: ~/kodi-depends
+          key: maven205-e00e52ee-armv7-ndk21e-ubuntu2204-v1
+      - name: Build dependencies
+        working-directory: kodi/tools/depends
+        if: steps.dep-cache.outputs.cache-hit != 'true'
+        run: |
+          make -j2
+          df -h
+      - name: Save dependency cache
+        uses: actions/cache/save@v4
+        if: steps.dep-cache.outputs.cache-hit != 'true'
+        with:
+          path: ~/kodi-depends
+          key: maven205-e00e52ee-armv7-ndk21e-ubuntu2204-v1
       - name: Build libusb ARMv7
         working-directory: kodi
         run: |
@@ -1003,17 +1013,17 @@ jobs:
           APK=$(find kodi "$RUNNER_TEMP/kodi-build" -name 'kodiapp-*.apk' -print -quit)
           test -n "$APK"
           mkdir -p output
-          cp "$APK" output/Maven-20.5-DirectUSB-RC1.apk
+          cp "$APK" output/Maven-20.5-DirectUSB-RC1-fix1.apk
           "$ANDROID_HOME/build-tools/30.0.3/aapt" dump badging \
-            output/Maven-20.5-DirectUSB-RC1.apk > output/apk-info.txt
+            output/Maven-20.5-DirectUSB-RC1-fix1.apk > output/apk-info.txt
           cat output/apk-info.txt
           grep -F "package: name='org.xbmc.kodi.directusb'" output/apk-info.txt
-          unzip -l output/Maven-20.5-DirectUSB-RC1.apk | grep 'lib/armeabi-v7a/libkodi.so'
-          unzip -p output/Maven-20.5-DirectUSB-RC1.apk lib/armeabi-v7a/libkodi.so > "$RUNNER_TEMP/libkodi-rc1.so"
+          unzip -l output/Maven-20.5-DirectUSB-RC1-fix1.apk | grep 'lib/armeabi-v7a/libkodi.so'
+          unzip -p output/Maven-20.5-DirectUSB-RC1-fix1.apk lib/armeabi-v7a/libkodi.so > "$RUNNER_TEMP/libkodi-rc1.so"
           strings "$RUNNER_TEMP/libkodi-rc1.so" | grep -F 'M345_READY'
           strings "$RUNNER_TEMP/libkodi-rc1.so" | grep -F 'M345_EXACT24_BLOCK'
           "$ANDROID_HOME/build-tools/30.0.3/aapt" dump xmltree \
-            output/Maven-20.5-DirectUSB-RC1.apk AndroidManifest.xml > output/manifest-info.txt
+            output/Maven-20.5-DirectUSB-RC1-fix1.apk AndroidManifest.xml > output/manifest-info.txt
           grep -F 'UsbDirectProbe' output/manifest-info.txt
           cp "$RUNNER_TEMP/directusb-test-wavs"/*.wav output/
           cp kodi/directusb/libusb-COPYING output/
@@ -1025,12 +1035,11 @@ jobs:
             xbmc/cores/AudioEngine/Sinks/AESinkUSBDirect.h \
             tools/android/packaging/xbmc/src/UsbDirectProbe.java.in
           cp "$RUNNER_TEMP/libusb-1.0.27.tar.bz2" output/
-          printf '%s\n' 'Kodi base: https://github.com/Maven85/kodi/tree/e00e52ee98f05b241d55aa9aff25e08130cac04f' 'RC1 is an experimental build; not yet hardware validated.' > output/source-info.txt
-          sha256sum output/Maven-20.5-DirectUSB-RC1.apk > output/apk.sha256
+          printf '%s\n' 'Kodi base: https://github.com/Maven85/kodi/tree/e00e52ee98f05b241d55aa9aff25e08130cac04f' 'RC1-fix1 is an experimental build; not yet hardware validated.' > output/source-info.txt
+          sha256sum output/Maven-20.5-DirectUSB-RC1-fix1.apk > output/apk.sha256
       - name: Upload APK and verification files
         uses: actions/upload-artifact@v4
         with:
-          name: Maven-20.5-DirectUSB-RC1
+          name: Maven-20.5-DirectUSB-RC1-fix1
           path: output/
           if-no-files-found: error
-          
