@@ -1,4 +1,4 @@
-name: Maven 20.5 Direct USB ARMv7 RC1-fix1
+name: Maven 20.5 Direct USB ARMv7 RC1-fix2
 on:
   workflow_dispatch:
 permissions:
@@ -843,14 +843,24 @@ jobs:
           p='tools/android/packaging/xbmc/src/Main.java.in'
           marker='public static Main MainActivity = null;'
           replace(p,marker,marker+(base/'MainAddition.java.txt').read_text())
-          manifest='tools/android/packaging/xbmc/AndroidManifest.xml.in'
-          replace(manifest,'</application>','''
-              <activity android:name=".UsbDirectProbe"
-                  android:label="Direct USB Authorization"
-                  android:screenOrientation="landscape"
-                  android:permission="android.permission.DUMP"
-                  android:exported="true" />
-          </application>''')
+          manifest=root/'tools/android/packaging/xbmc/AndroidManifest.xml.in'
+          text=manifest.read_text()
+          # Replace the entire closing-tag line, including its leading indentation.
+          # Inserting a leading newline after indentation leaves a whitespace-only line.
+          def add_usb_activity(match):
+              indent=match.group(1)
+              activity=[
+                  '    <activity android:name=".UsbDirectProbe"',
+                  '        android:label="Direct USB Authorization"',
+                  '        android:screenOrientation="landscape"',
+                  '        android:permission="android.permission.DUMP"',
+                  '        android:exported="true" />',
+                  '</application>',
+              ]
+              return '\n'.join(indent+line for line in activity)
+          text,n=re.subn(r'(?m)^([ \t]*)</application>[ \t]*$',add_usb_activity,text)
+          assert n==1, f'Expected one application closing tag, found {n}'
+          manifest.write_text(text)
           replace('cmake/scripts/android/Install.cmake','src/Main.java','src/Main.java\n                  src/UsbDirectProbe.java')
           replace('xbmc/platform/android/activity/XBMCApp.h',
                   'static CXBMCApp& Get() { return *m_appinstance; }',
@@ -920,7 +930,7 @@ jobs:
           else:
               # This log is diagnostic only; it must not block an otherwise valid build.
               print(f'Optional source negotiation log skipped: found {n} matching statements')
-          print('RC1-fix1 overlay applied to the pinned source')
+          print('RC1-fix2 overlay applied to the pinned source')
           RC1_SOURCE_6_0_EOF
 
           cat > xbmc/cores/AudioEngine/Sinks/AESinkUSBDirect.h <<'EOF'
@@ -1013,17 +1023,17 @@ jobs:
           APK=$(find kodi "$RUNNER_TEMP/kodi-build" -name 'kodiapp-*.apk' -print -quit)
           test -n "$APK"
           mkdir -p output
-          cp "$APK" output/Maven-20.5-DirectUSB-RC1-fix1.apk
+          cp "$APK" output/Maven-20.5-DirectUSB-RC1-fix2.apk
           "$ANDROID_HOME/build-tools/30.0.3/aapt" dump badging \
-            output/Maven-20.5-DirectUSB-RC1-fix1.apk > output/apk-info.txt
+            output/Maven-20.5-DirectUSB-RC1-fix2.apk > output/apk-info.txt
           cat output/apk-info.txt
           grep -F "package: name='org.xbmc.kodi.directusb'" output/apk-info.txt
-          unzip -l output/Maven-20.5-DirectUSB-RC1-fix1.apk | grep 'lib/armeabi-v7a/libkodi.so'
-          unzip -p output/Maven-20.5-DirectUSB-RC1-fix1.apk lib/armeabi-v7a/libkodi.so > "$RUNNER_TEMP/libkodi-rc1.so"
+          unzip -l output/Maven-20.5-DirectUSB-RC1-fix2.apk | grep 'lib/armeabi-v7a/libkodi.so'
+          unzip -p output/Maven-20.5-DirectUSB-RC1-fix2.apk lib/armeabi-v7a/libkodi.so > "$RUNNER_TEMP/libkodi-rc1.so"
           strings "$RUNNER_TEMP/libkodi-rc1.so" | grep -F 'M345_READY'
           strings "$RUNNER_TEMP/libkodi-rc1.so" | grep -F 'M345_EXACT24_BLOCK'
           "$ANDROID_HOME/build-tools/30.0.3/aapt" dump xmltree \
-            output/Maven-20.5-DirectUSB-RC1-fix1.apk AndroidManifest.xml > output/manifest-info.txt
+            output/Maven-20.5-DirectUSB-RC1-fix2.apk AndroidManifest.xml > output/manifest-info.txt
           grep -F 'UsbDirectProbe' output/manifest-info.txt
           cp "$RUNNER_TEMP/directusb-test-wavs"/*.wav output/
           cp kodi/directusb/libusb-COPYING output/
@@ -1035,11 +1045,11 @@ jobs:
             xbmc/cores/AudioEngine/Sinks/AESinkUSBDirect.h \
             tools/android/packaging/xbmc/src/UsbDirectProbe.java.in
           cp "$RUNNER_TEMP/libusb-1.0.27.tar.bz2" output/
-          printf '%s\n' 'Kodi base: https://github.com/Maven85/kodi/tree/e00e52ee98f05b241d55aa9aff25e08130cac04f' 'RC1-fix1 is an experimental build; not yet hardware validated.' > output/source-info.txt
-          sha256sum output/Maven-20.5-DirectUSB-RC1-fix1.apk > output/apk.sha256
+          printf '%s\n' 'Kodi base: https://github.com/Maven85/kodi/tree/e00e52ee98f05b241d55aa9aff25e08130cac04f' 'RC1-fix2 is an experimental build; not yet hardware validated.' > output/source-info.txt
+          sha256sum output/Maven-20.5-DirectUSB-RC1-fix2.apk > output/apk.sha256
       - name: Upload APK and verification files
         uses: actions/upload-artifact@v4
         with:
-          name: Maven-20.5-DirectUSB-RC1-fix1
+          name: Maven-20.5-DirectUSB-RC1-fix2
           path: output/
           if-no-files-found: error
