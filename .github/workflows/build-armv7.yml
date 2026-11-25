@@ -55,9 +55,10 @@ jobs:
 
           cat version.txt
 
-      - name: Generate signing key
+      - name: Generate debug signing key
         run: |
           mkdir -p "$HOME/.android"
+
           if [ ! -f "$HOME/.android/debug.keystore" ]; then
             keytool -genkeypair \
               -keystore "$HOME/.android/debug.keystore" \
@@ -70,7 +71,6 @@ jobs:
               -dname "CN=Android Debug,O=Android,C=US"
           fi
 
-
       - name: Configure ARMv7
         working-directory: kodi/tools/depends
         run: |
@@ -79,19 +79,19 @@ jobs:
 
           test -f "$ANDROID_HOME/platforms/android-33/android.jar"
           test -f "$ANDROID_HOME/ndk/21.4.7075529/source.properties"
-          sdkmanager --version
 
           python3 - <<'PY'
           from pathlib import Path
 
           p = Path("configure.ac")
-          text = p.read_text()
+          s = p.read_text()
 
           old = 'if [ ! test -f $use_sdk_path/tools/bin/sdkmanager ]; then'
           new = 'if ! command -v sdkmanager >/dev/null 2>&1; then'
 
-          assert old in text, "SDK path check not found"
-          p.write_text(text.replace(old, new, 1))
+          assert old in s, "SDK path check not found"
+
+          p.write_text(s.replace(old, new, 1))
 
           print("Modern Android SDK compatibility patch applied")
           PY
@@ -107,17 +107,405 @@ jobs:
             --prefix="$HOME/kodi-depends" \
             --enable-debug=no
 
+      - name: Restore dependency cache
+        id: dep-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/kodi-depends
+          key: maven205-e00e52ee-armv7-ndk21e-ubuntu2204-v1
 
       - name: Build dependencies
+        if: steps.dep-cache.outputs.cache-hit != 'true'
         working-directory: kodi/tools/depends
         run: |
           make -j2
           df -h
 
+      - name: Save dependency cache
+        if: steps.dep-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/kodi-depends
+          key: maven205-e00e52ee-armv7-ndk21e-ubuntu2204-v1
+
+      - name: Add M1 Direct USB probe
+        working-directory: kodi
+        run: |
+          cat > tools/android/packaging/xbmc/src/UsbDirectProbe.java.in <<'JAVA'
+          package @APP_PACKAGE@;
+
+          import android.app.Activity;
+          import android.app.PendingIntent;
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.IntentFilter;
+          import android.hardware.usb.*;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.util.Log;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.TextView;
+          import java.util.UUID;
+
+          public class UsbDirectProbe extends Activity {
+
+              private static final String TAG = "KodiDirectUSB";
+
+              private UsbManager manager;
+              private TextView status;
+              private String permissionAction;
+              private boolean registered = false;
+
+              private final BroadcastReceiver receiver =
+                  new BroadcastReceiver() {
+                      @Override
+                      public void onReceive(
+                          Context context,
+                          Intent intent
+                      ) {
+                          if (permissionAction.equals(intent.getAction())) {
+                              probe(false);
+                          }
+                      }
+                  };
+
+              @Override
+              protected void onCreate(Bundle state) {
+
+                  super.onCreate(state);
+
+                  manager = (UsbManager)
+                      getSystemService(USB_SERVICE);
+
+                  permissionAction = getPackageName() +
+                      ".USB_PERMISSION." +
+                      UUID.randomUUID().toString();
+
+                  LinearLayout layout = new LinearLayout(this);
+
+                  layout.setOrientation(LinearLayout.VERTICAL);
+                  layout.setPadding(40, 40, 40, 40);
+                  layout.setBackgroundColor(0xff101820);
+
+                  status = new TextView(this);
+                  status.setTextColor(0xffffffff);
+                  status.setTextSize(22);
+
+                  layout.addView(status);
+
+                  Button retry = new Button(this);
+                  retry.setText("Retry USB detection");
+                  retry.setOnClickListener(v -> probe(true));
+
+                  layout.addView(retry);
+
+                  Button close = new Button(this);
+                  close.setText("Close diagnostic");
+                  close.setOnClickListener(v -> finish());
+
+                  layout.addView(close);
+
+                  setContentView(layout);
+
+                  retry.requestFocus();
+
+                  IntentFilter filter =
+                      new IntentFilter(permissionAction);
+
+                  if (Build.VERSION.SDK_INT >= 33) {
+
+                      registerReceiver(
+                          receiver,
+                          filter,
+                          Context.RECEIVER_NOT_EXPORTED
+                      );
+
+                  } else {
+
+                      registerReceiver(receiver, filter);
+
+                  }
+
+                  registered = true;
+
+                  probe(true);
+              }
+
+              private void report(String text) {
+
+                  Log.i(TAG, text);
+                  status.setText(text);
+
+              }
+
+              private UsbDevice findDac() {
+
+                  for (UsbDevice d :
+                       manager.getDeviceList().values()) {
+
+                      Log.i(
+                          TAG,
+                          String.format(
+                              "USB device %04x:%04x %s",
+                              d.getVendorId(),
+                              d.getProductId(),
+                              d.getProductName()
+                          )
+                      );
+
+                      if (
+                          d.getVendorId() == 0x152a &&
+                          d.getProductId() == 0x8750
+                      ) {
+                          return d;
+                      }
+                  }
+
+                  return null;
+              }
+
+              private void probe(boolean requestPermission) {
+
+                  try {
+
+                      if (manager == null) {
+
+                          report("M1_FAIL: UsbManager unavailable");
+                          return;
+
+                      }
+
+                      UsbDevice dac = findDac();
+
+                      if (dac == null) {
+
+                          report("M1_FAIL: DX3 Pro+ not found");
+                          return;
+
+                      }
+
+                      boolean audioControl = false;
+                      boolean audioOutput = false;
+
+                      for (
+                          int i = 0;
+                          i < dac.getInterfaceCount();
+                          i++
+                      ) {
+
+                          UsbInterface intf =
+                              dac.getInterface(i);
+
+                          Log.i(
+                              TAG,
+                              "Interface=" + intf.getId() +
+                              " alt=" + intf.getAlternateSetting() +
+                              " class=" + intf.getInterfaceClass() +
+                              " subclass=" + intf.getInterfaceSubclass() +
+                              " protocol=" + intf.getInterfaceProtocol()
+                          );
+
+                          boolean uac2 =
+                              intf.getInterfaceClass() == 1 &&
+                              intf.getInterfaceProtocol() == 0x20;
+
+                          if (
+                              uac2 &&
+                              intf.getInterfaceSubclass() == 1
+                          ) {
+
+                              audioControl = true;
+
+                          }
+
+                          for (
+                              int j = 0;
+                              j < intf.getEndpointCount();
+                              j++
+                          ) {
+
+                              UsbEndpoint ep =
+                                  intf.getEndpoint(j);
+
+                              Log.i(
+                                  TAG,
+                                  String.format(
+                                      "Endpoint=0x%02x type=%d maxPacket=%d interval=%d",
+                                      ep.getAddress(),
+                                      ep.getType(),
+                                      ep.getMaxPacketSize(),
+                                      ep.getInterval()
+                                  )
+                              );
+
+                              if (
+                                  uac2 &&
+                                  intf.getInterfaceSubclass() == 2 &&
+                                  ep.getType() ==
+                                      UsbConstants.USB_ENDPOINT_XFER_ISOC &&
+                                  ep.getDirection() ==
+                                      UsbConstants.USB_DIR_OUT
+                              ) {
+
+                                  audioOutput = true;
+
+                              }
+                          }
+                      }
+
+                      if (!audioControl || !audioOutput) {
+
+                          report("M1_FAIL: UAC2 interfaces missing");
+                          return;
+
+                      }
+
+                      if (!manager.hasPermission(dac)) {
+
+                          report(
+                              "DX3 Pro+ detected. USB permission required."
+                          );
+
+                          if (requestPermission) {
+
+                              PendingIntent pi =
+                                  PendingIntent.getBroadcast(
+                                      this,
+                                      0,
+                                      new Intent(permissionAction)
+                                          .setPackage(getPackageName()),
+                                      PendingIntent.FLAG_IMMUTABLE |
+                                      PendingIntent.FLAG_ONE_SHOT
+                                  );
+
+                              manager.requestPermission(dac, pi);
+
+                          }
+
+                          return;
+                      }
+
+                      UsbDeviceConnection connection =
+                          manager.openDevice(dac);
+
+                      if (connection == null) {
+
+                          report("M1_FAIL: openDevice returned null");
+                          return;
+
+                      }
+
+                      int fd;
+                      int descriptorLength;
+
+                      try {
+
+                          fd = connection.getFileDescriptor();
+
+                          byte[] raw =
+                              connection.getRawDescriptors();
+
+                          descriptorLength =
+                              raw == null ? 0 : raw.length;
+
+                      } finally {
+
+                          connection.close();
+
+                      }
+
+                      if (fd < 0) {
+
+                          report("M1_FAIL: invalid file descriptor");
+                          return;
+
+                      }
+
+                      report(
+                          "M1_PASS: TOPPING DX3 Pro+\n" +
+                          "VID/PID: 152A:8750\n" +
+                          "UAC2: confirmed\n" +
+                          "Permission: granted\n" +
+                          "USB fd: " + fd + "\n" +
+                          "Descriptors: " + descriptorLength + " bytes\n" +
+                          "USB connection closed safely."
+                      );
+
+                  } catch (Exception e) {
+
+                      Log.e(TAG, "M1 exception", e);
+
+                      report("M1_FAIL: " + e.toString());
+
+                  }
+              }
+
+              @Override
+              protected void onDestroy() {
+
+                  if (registered) {
+
+                      unregisterReceiver(receiver);
+
+                  }
+
+                  super.onDestroy();
+              }
+          }
+          JAVA
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          manifest = Path(
+              "tools/android/packaging/xbmc/AndroidManifest.xml.in"
+          )
+
+          text = manifest.read_text()
+
+          marker = "</application>"
+
+          assert text.count(marker) == 1
+
+          activity = '''
+              <activity
+                  android:name=".UsbDirectProbe"
+                  android:label="Direct USB Diagnostic"
+                  android:screenOrientation="landscape"
+                  android:permission="android.permission.DUMP"
+                  android:exported="true" />
+          '''
+
+          manifest.write_text(
+              text.replace(marker, activity + marker, 1)
+          )
+
+          cmake = Path("cmake/scripts/android/Install.cmake")
+
+          text = cmake.read_text()
+
+          marker = "src/Main.java"
+
+          assert text.count(marker) == 1
+
+          cmake.write_text(
+              text.replace(
+                  marker,
+                  marker + "\n                  src/UsbDirectProbe.java",
+                  1
+              )
+          )
+
+          print("M1 USB probe added to Android packaging")
+          PY
+
       - name: Configure Kodi
         working-directory: kodi
         run: |
           mkdir -p "$RUNNER_TEMP/kodi-build"
+
           make -C tools/depends/target/cmakebuildsys \
             BUILD_DIR="$RUNNER_TEMP/kodi-build"
 
@@ -132,24 +520,37 @@ jobs:
       - name: Verify APK
         run: |
           APK=$(find kodi -name 'kodiapp-*.apk' -print -quit)
+
           test -n "$APK"
 
           mkdir -p output
-          cp "$APK" output/Maven-20.5-DirectUSB-M0.apk
+
+          cp "$APK" output/Maven-20.5-DirectUSB-M1.apk
 
           "$ANDROID_HOME/build-tools/30.0.3/aapt" \
-            dump badging output/*.apk > output/apk-info.txt
+            dump badging output/*.apk \
+            > output/apk-info.txt
 
           cat output/apk-info.txt
 
           grep -F "package: name='org.xbmc.kodi.directusb'" \
             output/apk-info.txt
 
-          unzip -l output/*.apk | grep 'lib/armeabi-v7a/libkodi.so'
+          unzip -l output/*.apk | \
+            grep 'lib/armeabi-v7a/libkodi.so'
+
+          "$ANDROID_HOME/build-tools/30.0.3/aapt" \
+            dump xmltree \
+            output/Maven-20.5-DirectUSB-M1.apk \
+            AndroidManifest.xml \
+            > output/manifest-info.txt
+
+          grep -F "UsbDirectProbe" \
+            output/manifest-info.txt
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: Maven-20.5-DirectUSB-M0
+          name: Maven-20.5-DirectUSB-M1
           path: output/
           if-no-files-found: error
